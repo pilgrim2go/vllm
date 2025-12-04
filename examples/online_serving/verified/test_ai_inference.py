@@ -68,9 +68,9 @@ class AiInferenceEngine:
             "model": self.model,
             "prompt": prompt,
             "max_tokens": max_tokens_to_use,
-            "temperature": 0.0,
-            "logprobs": 1,
-            "prompt_logprobs": 1
+            # "temperature": 0.0,
+            # "logprobs": 1,
+            # "prompt_logprobs": 1
         }
         
         response = self.session.post(endpoint, json=payload, timeout=self.timeout_seconds)
@@ -106,10 +106,10 @@ class AiInferenceEngine:
             "model": self.model,
             "messages": [{"role": msg.role, "content": msg.content} for msg in messages],
             "max_tokens": max_tokens_to_use,
-            "temperature": 0.0,
-            "logprobs": True,
-            "top_logprobs": 1,
-            "prompt_logprobs": 1
+            # "temperature": 0.0,
+            # "logprobs": True,
+            # "top_logprobs": 1,
+            # "prompt_logprobs": 1
         }
         
         response = self.session.post(endpoint, json=payload, timeout=self.timeout_seconds)
@@ -150,8 +150,8 @@ class AiInferenceEngine:
             "prompt": prompt_tokens,
             "completion": text_tokens,
             "check_greedy": True,
-            "prompt_logprobs": 5,  # Request logprobs for verification (ensures we get logprobs for all positions)
-            "greedy_logprob_threshold": 0.1  # Higher threshold for CUDA graphs + bfloat16 precision tolerance
+            "prompt_logprobs": 0,  # Request logprobs for verification (ensures we get logprobs for all positions)
+            "greedy_logprob_threshold": 0.001  # Higher threshold for CUDA graphs + bfloat16 precision tolerance
         }
         
         response = self.session.post(endpoint, json=payload, timeout=self.timeout_seconds)
