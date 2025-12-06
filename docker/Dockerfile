@@ -290,6 +290,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
           touch /tmp/ep_kernels_workspace/dist/.ep_kernels_skipped ); \
     fi
 
+# Ensure nvshmem and dist directories exist even if EP kernels were skipped or failed
+# This is required for the bind mounts in the vllm-base stage
+RUN mkdir -p /tmp/ep_kernels_workspace/nvshmem && \
+    mkdir -p /tmp/ep_kernels_workspace/dist
+
 # Check the size of the wheel if RUN_WHEEL_CHECK is true
 COPY .buildkite/check-wheel-size.py check-wheel-size.py
 # sync the default value with .buildkite/check-wheel-size.py
@@ -474,7 +479,7 @@ RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/nvshmem,target=/t
               cp -r /tmp/nvshmem/* /vllm-workspace/nvshmem/; \
            else \
               echo "NVSHMEM not found; EP kernels may not have been built."; \
-              mkdir -p /vllm-workspace/nvshmem; \
+              mkdir -p /vllm-workspace/nvshmem/lib; \
            fi'
 
 # Add NVSHMEM library path to LD_LIBRARY_PATH
@@ -495,7 +500,8 @@ RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm
 # Install gdrcopy (optional - used for GPU Direct RDMA optimization)
 # Note: gdrcopy packages may not be available for all CUDA versions
 ARG SKIP_GDRCOPY
-RUN --mount=type=bind,source=tools/install_gdrcopy.sh,target=/tmp/install_gdrcopy.sh,ro \
+COPY tools/install_gdrcopy.sh /tmp/install_gdrcopy.sh
+RUN chmod +x /tmp/install_gdrcopy.sh && \
     if [ "$SKIP_GDRCOPY" != "true" ]; then \
         set -eux; \
         case "${TARGETPLATFORM}" in \

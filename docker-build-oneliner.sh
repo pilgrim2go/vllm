@@ -19,6 +19,9 @@
 #   - SKIP_FLASHINFER=true    : Skip FlashInfer (attention optimization)
 #   - SKIP_GDRCOPY=true       : Skip gdrcopy (GPU Direct RDMA)
 #   - SKIP_ALL_OPTIONAL=true  : Skip all optional components at once
+#
+# Build mode:
+#   - Always builds from source (no precompiled wheels)
 
 MAX_JOBS=${MAX_JOBS:-32}
 NVCC_THREADS=${NVCC_THREADS:-8}
@@ -43,7 +46,7 @@ if [ "$SKIP_ALL_OPTIONAL" = "true" ]; then
     echo "Skipping all optional components (DeepGEMM, EP kernels, FlashInfer, gdrcopy)"
 fi
 
-# Option 1: Using docker buildx (builds from source - required for custom source)
+# Option 1: Using docker buildx (builds from source)
 echo "Building with docker buildx (compiling CUDA kernels from source)..."
 echo "Note: Skipping wheel size check (custom source may produce larger wheels)"
 echo "Optional components: DeepGEMM=${SKIP_DEEPGEMM}, EP kernels=${SKIP_EP_KERNELS}, FlashInfer=${SKIP_FLASHINFER}, gdrcopy=${SKIP_GDRCOPY}"
@@ -65,26 +68,6 @@ DOCKER_BUILDKIT=1 docker buildx build --platform linux/amd64 \
   -t ${TAG} \
   -f docker/Dockerfile .
 
-# Option 1b: Using docker buildx WITH precompiled (FASTEST - only if NO custom source)
-# Uncomment ONLY if you have NO custom source modifications in csrc/:
-# DOCKER_BUILDKIT=1 docker buildx build --platform linux/amd64 \
-#   --build-arg CUDA_VERSION=12.4.0 \
-#   --build-arg PYTHON_VERSION=3.12 \
-#   --build-arg BUILD_BASE_IMAGE=nvidia/cuda:12.4.0-devel-ubuntu22.04 \
-#   --build-arg FINAL_BASE_IMAGE=nvidia/cuda:12.4.0-base-ubuntu22.04 \
-#   --build-arg max_jobs=${MAX_JOBS} \
-#   --build-arg nvcc_threads=${NVCC_THREADS} \
-#   --build-arg torch_cuda_arch_list=${TORCH_CUDA_ARCH} \
-#   --build-arg VLLM_USE_PRECOMPILED=1 \
-#   --build-arg RUN_WHEEL_CHECK=false \
-#   --build-arg SKIP_DEEPGEMM=${SKIP_DEEPGEMM} \
-#   --build-arg SKIP_EP_KERNELS=${SKIP_EP_KERNELS} \
-#   --build-arg SKIP_FLASHINFER=${SKIP_FLASHINFER} \
-#   --build-arg SKIP_GDRCOPY=${SKIP_GDRCOPY} \
-#   --target ${TARGET} \
-#   --load \
-#   -t ${TAG} \
-#   -f docker/Dockerfile .
 
 # Option 2: Using regular docker build (if buildx not available)
 # Uncomment and use this if buildx is not available:
