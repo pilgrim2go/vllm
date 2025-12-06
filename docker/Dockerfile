@@ -73,6 +73,12 @@ ARG UV_KEYRING_PROVIDER=${PIP_KEYRING_PROVIDER}
 # Flag enables built-in KV-connector dependency libs into docker images
 ARG INSTALL_KV_CONNECTORS=false
 
+# Flags to skip optional components for faster builds
+ARG SKIP_DEEPGEMM=false
+ARG SKIP_EP_KERNELS=false
+ARG SKIP_FLASHINFER=false
+ARG SKIP_GDRCOPY=false
+
 #################### BASE BUILD IMAGE ####################
 # prepare basic build environment
 FROM ${BUILD_BASE_IMAGE} AS base
@@ -238,10 +244,15 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
 
 # Install DeepGEMM from source
 ARG DEEPGEMM_GIT_REF
+ARG SKIP_DEEPGEMM
 COPY tools/install_deepgemm.sh /tmp/install_deepgemm.sh
 RUN chmod +x /tmp/install_deepgemm.sh
 RUN --mount=type=cache,target=/root/.cache/uv \
-    VLLM_DOCKER_BUILD_CONTEXT=1 TORCH_CUDA_ARCH_LIST="9.0a 10.0a" /tmp/install_deepgemm.sh --cuda-version "${CUDA_VERSION}" ${DEEPGEMM_GIT_REF:+--ref "$DEEPGEMM_GIT_REF"} --wheel-dir /tmp/deepgemm/dist
+    if [ "$SKIP_DEEPGEMM" != "true" ]; then \
+        VLLM_DOCKER_BUILD_CONTEXT=1 TORCH_CUDA_ARCH_LIST="9.0a 10.0a" /tmp/install_deepgemm.sh --cuda-version "${CUDA_VERSION}" ${DEEPGEMM_GIT_REF:+--ref "$DEEPGEMM_GIT_REF"} --wheel-dir /tmp/deepgemm/dist; \
+    else \
+        echo "Skipping DeepGEMM installation (SKIP_DEEPGEMM=true)"; \
+    fi
 
 # Ensure the wheel dir exists so later-stage COPY won't fail when DeepGEMM is skipped
 RUN mkdir -p /tmp/deepgemm/dist && touch /tmp/deepgemm/dist/.deepgemm_skipped
@@ -252,26 +263,32 @@ RUN chmod +x /tmp/install_python_libraries.sh
 # Make build optional - continue even if it fails
 ARG PPLX_COMMIT_HASH
 ARG DEEPEP_COMMIT_HASH
+ARG SKIP_EP_KERNELS
 RUN --mount=type=cache,target=/root/.cache/uv \
     mkdir -p /tmp/ep_kernels_workspace/dist && \
-    ( export TORCH_CUDA_ARCH_LIST='9.0a 10.0a' && \
-      /tmp/install_python_libraries.sh \
-        --workspace /tmp/ep_kernels_workspace \
-        --mode wheel \
-        ${PPLX_COMMIT_HASH:+--pplx-ref "$PPLX_COMMIT_HASH"} \
-        ${DEEPEP_COMMIT_HASH:+--deepep-ref "$DEEPEP_COMMIT_HASH"} && \
-      find /tmp/ep_kernels_workspace/nvshmem -name '*.a' -delete ) || \
-    ( echo "WARNING: EP kernels build failed with 9.0a 10.0a, trying with 9.0 10.0..." && \
-      export TORCH_CUDA_ARCH_LIST='9.0 10.0' && \
-      /tmp/install_python_libraries.sh \
-        --workspace /tmp/ep_kernels_workspace \
-        --mode wheel \
-        ${PPLX_COMMIT_HASH:+--pplx-ref "$PPLX_COMMIT_HASH"} \
-        ${DEEPEP_COMMIT_HASH:+--deepep-ref "$DEEPEP_COMMIT_HASH"} && \
-      find /tmp/ep_kernels_workspace/nvshmem -name '*.a' -delete ) || \
-    ( echo "WARNING: EP kernels build failed completely, continuing without them..." && \
-      echo "This is acceptable if you don't need EP kernels functionality." && \
-      touch /tmp/ep_kernels_workspace/dist/.ep_kernels_skipped )
+    if [ "$SKIP_EP_KERNELS" = "true" ]; then \
+        echo "Skipping EP kernels installation (SKIP_EP_KERNELS=true)" && \
+        touch /tmp/ep_kernels_workspace/dist/.ep_kernels_skipped; \
+    else \
+        ( export TORCH_CUDA_ARCH_LIST='9.0a 10.0a' && \
+          /tmp/install_python_libraries.sh \
+            --workspace /tmp/ep_kernels_workspace \
+            --mode wheel \
+            ${PPLX_COMMIT_HASH:+--pplx-ref "$PPLX_COMMIT_HASH"} \
+            ${DEEPEP_COMMIT_HASH:+--deepep-ref "$DEEPEP_COMMIT_HASH"} && \
+          find /tmp/ep_kernels_workspace/nvshmem -name '*.a' -delete ) || \
+        ( echo "WARNING: EP kernels build failed with 9.0a 10.0a, trying with 9.0 10.0..." && \
+          export TORCH_CUDA_ARCH_LIST='9.0 10.0' && \
+          /tmp/install_python_libraries.sh \
+            --workspace /tmp/ep_kernels_workspace \
+            --mode wheel \
+            ${PPLX_COMMIT_HASH:+--pplx-ref "$PPLX_COMMIT_HASH"} \
+            ${DEEPEP_COMMIT_HASH:+--deepep-ref "$DEEPEP_COMMIT_HASH"} && \
+          find /tmp/ep_kernels_workspace/nvshmem -name '*.a' -delete ) || \
+        ( echo "WARNING: EP kernels build failed completely, continuing without them..." && \
+          echo "This is acceptable if you don't need EP kernels functionality." && \
+          touch /tmp/ep_kernels_workspace/dist/.ep_kernels_skipped ); \
+    fi
 
 # Check the size of the wheel if RUN_WHEEL_CHECK is true
 COPY .buildkite/check-wheel-size.py check-wheel-size.py
@@ -316,6 +333,8 @@ FROM ${FINAL_BASE_IMAGE} AS vllm-base
 ARG CUDA_VERSION
 ARG PYTHON_VERSION
 ARG INSTALL_KV_CONNECTORS=false
+ARG SKIP_FLASHINFER
+ARG SKIP_GDRCOPY
 WORKDIR /vllm-workspace
 ENV DEBIAN_FRONTEND=noninteractive
 ARG TARGETPLATFORM
@@ -416,11 +435,16 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
 # Install FlashInfer pre-compiled kernel cache and binaries
 # https://docs.flashinfer.ai/installation.html
 # Note: flashinfer-jit-cache may not be available for all CUDA versions
+ARG SKIP_FLASHINFER
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system flashinfer-cubin==0.5.3 && \
-    ( uv pip install --system flashinfer-jit-cache==0.5.3 \
-        --extra-index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') || \
-      echo "WARNING: flashinfer-jit-cache not available for CUDA $(echo $CUDA_VERSION | cut -d. -f1,2). Continuing without it." )
+    if [ "$SKIP_FLASHINFER" != "true" ]; then \
+        uv pip install --system flashinfer-cubin==0.5.3 && \
+        ( uv pip install --system flashinfer-jit-cache==0.5.3 \
+            --extra-index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') || \
+          echo "WARNING: flashinfer-jit-cache not available for CUDA $(echo $CUDA_VERSION | cut -d. -f1,2). Continuing without it." ); \
+    else \
+        echo "Skipping FlashInfer installation (SKIP_FLASHINFER=true)"; \
+    fi
 COPY examples examples
 COPY benchmarks benchmarks
 COPY ./vllm/collect_env.py .
@@ -470,16 +494,21 @@ RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm
 
 # Install gdrcopy (optional - used for GPU Direct RDMA optimization)
 # Note: gdrcopy packages may not be available for all CUDA versions
+ARG SKIP_GDRCOPY
 RUN --mount=type=bind,source=tools/install_gdrcopy.sh,target=/tmp/install_gdrcopy.sh,ro \
-    set -eux; \
-    case "${TARGETPLATFORM}" in \
-      linux/arm64) UUARCH="aarch64" ;; \
-      linux/amd64) UUARCH="x64" ;; \
-      *) echo "Unsupported TARGETPLATFORM: ${TARGETPLATFORM}" >&2; exit 1 ;; \
-    esac; \
-    ( /tmp/install_gdrcopy.sh "${GDRCOPY_OS_VERSION}" "${GDRCOPY_CUDA_VERSION}" "${UUARCH}" ) || \
-    ( echo "WARNING: gdrcopy package not available for CUDA ${GDRCOPY_CUDA_VERSION}. Continuing without it." && \
-      echo "This is acceptable - gdrcopy is an optimization for GPU Direct RDMA, not required for vLLM to function." )
+    if [ "$SKIP_GDRCOPY" != "true" ]; then \
+        set -eux; \
+        case "${TARGETPLATFORM}" in \
+          linux/arm64) UUARCH="aarch64" ;; \
+          linux/amd64) UUARCH="x64" ;; \
+          *) echo "Unsupported TARGETPLATFORM: ${TARGETPLATFORM}" >&2; exit 1 ;; \
+        esac; \
+        ( /tmp/install_gdrcopy.sh "${GDRCOPY_OS_VERSION}" "${GDRCOPY_CUDA_VERSION}" "${UUARCH}" ) || \
+        ( echo "WARNING: gdrcopy package not available for CUDA ${GDRCOPY_CUDA_VERSION}. Continuing without it." && \
+          echo "This is acceptable - gdrcopy is an optimization for GPU Direct RDMA, not required for vLLM to function." ); \
+    else \
+        echo "Skipping gdrcopy installation (SKIP_GDRCOPY=true)"; \
+    fi
 
 # CUDA image changed from /usr/local/nvidia to /usr/local/cuda in 12.8 but will
 # return to /usr/local/nvidia in 13.0 to allow container providers to mount drivers
