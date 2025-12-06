@@ -1,0 +1,221 @@
+# Simple Dockerfile for Ubuntu 22.04 with CUDA 12.2
+# Based on setup_testnet_ubuntu22.sh
+# This is a simplified version for building vLLM on Ubuntu 22.04
+
+ARG CUDA_VERSION=12.2.2
+ARG PYTHON_VERSION=3.12
+ARG BUILD_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
+ARG FINAL_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-base-ubuntu22.04
+ARG GET_PIP_URL="https://bootstrap.pypa.io/get-pip.py"
+
+#################### BUILD STAGE ####################
+FROM ${BUILD_BASE_IMAGE} AS build
+
+ARG CUDA_VERSION
+ARG PYTHON_VERSION
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+    build-essential \
+    dkms \
+    linux-headers-$(uname -r) \
+    cmake \
+    ninja-build \
+    gcc-12 \
+    g++-12 \
+    git \
+    wget \
+    curl \
+    python3 \
+    python3-pip \
+    python3-venv \
+    software-properties-common \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install CMake 3.26+ from Kitware (Ubuntu 22.04 default is 3.22.1, too old)
+RUN apt-get update -y && \
+    apt-get remove -y cmake cmake-data 2>/dev/null || true && \
+    wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | \
+        gpg --dearmor - | tee /etc/apt/trusted.gpg.d/kitware.gpg >/dev/null && \
+    echo "deb https://apt.kitware.com/ubuntu/ jammy main" | \
+        tee /etc/apt/sources.list.d/kitware.list >/dev/null && \
+    apt-get update -y && \
+    apt-get install -y cmake && \
+    rm -rf /var/lib/apt/lists/* && \
+    cmake --version
+
+# Set up GCC 12 as default compiler
+RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 120 \
+    --slave /usr/bin/g++ g++ /usr/bin/g++-12 && \
+    gcc --version
+
+# Install Python 3.12 if needed (CUDA base image may have older Python)
+# Check if the requested Python version is already available
+RUN PYTHON_MAJOR_MINOR=$(echo ${PYTHON_VERSION} | cut -d. -f1,2) && \
+    if ! command -v python${PYTHON_VERSION} >/dev/null 2>&1; then \
+        add-apt-repository -y ppa:deadsnakes/ppa && \
+        apt-get update -y && \
+        apt-get install -y python${PYTHON_VERSION} python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 2>/dev/null || true && \
+    update-alternatives --set python3 /usr/bin/python${PYTHON_VERSION} && \
+    ln -sf /usr/bin/python${PYTHON_VERSION}-config /usr/bin/python3-config 2>/dev/null || true && \
+    python3 --version
+
+# Set up CUDA paths
+ENV PATH=/usr/local/cuda-12.2/bin:$PATH
+ENV LD_LIBRARY_PATH=/usr/local/cuda-12.2/lib64:$LD_LIBRARY_PATH
+
+# Create Python virtual environment
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+ENV VIRTUAL_ENV="/opt/venv"
+
+# Upgrade pip and install build dependencies
+RUN pip install --upgrade pip setuptools wheel build && \
+    pip install "setuptools>=77.0.3,<80.0.0" "setuptools-scm>=8.0" packaging jinja2
+
+# Install PyTorch 2.8.0 (matching Dockerfile requirements/cuda.txt)
+# PyTorch 2.8.0 requires cu128 index but is backward compatible with CUDA 12.2 runtime
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+    --index-url https://download.pytorch.org/whl/cu128 && \
+    python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}')"
+
+# Install NumPy compatibility
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install "numpy<2" --upgrade
+
+# Install vLLM dependencies (copy requirements first for better caching)
+COPY requirements/common.txt requirements/common.txt
+COPY requirements/cuda.txt requirements/cuda.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements/cuda.txt
+
+# Install build dependencies
+COPY requirements/build.txt requirements/build.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements/build.txt
+
+# Install ccache for faster C/C++ rebuilds
+RUN apt-get update -y && apt-get install -y --no-install-recommends ccache && \
+    rm -rf /var/lib/apt/lists/*
+
+# Set CUDA architecture list
+ARG torch_cuda_arch_list='7.0 7.5 8.0 8.9 9.0 10.0 12.0'
+ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
+
+# Set up ccache
+ENV CCACHE_DIR=/root/.cache/ccache
+ENV PATH="/usr/lib/ccache:$PATH"
+
+# Copy vLLM source (do this last so source changes don't invalidate dependency cache)
+WORKDIR /workspace
+COPY . .
+
+# Build vLLM from source as a wheel with cache mounts
+# Cache mounts prevent rebuilding C code when only Python code changes
+ARG max_jobs=2
+ENV MAX_JOBS=${max_jobs}
+ENV VLLM_DOCKER_BUILD_CONTEXT=1
+
+# Use cache mounts to avoid rebuilding C code
+# ccache caches compiled object files, pip cache stores downloaded packages
+RUN --mount=type=cache,target=/root/.cache/ccache \
+    --mount=type=cache,target=/root/.cache/pip \
+    CC=/usr/lib/ccache/gcc-12 CXX=/usr/lib/ccache/g++-12 CUDAHOSTCXX=/usr/bin/g++-12 \
+    python setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38
+
+# Verify wheel was created
+RUN ls -lh dist/*.whl
+
+#################### RUNTIME STAGE ####################
+FROM ${FINAL_BASE_IMAGE} AS runtime
+
+ARG CUDA_VERSION
+ARG PYTHON_VERSION
+ARG GET_PIP_URL
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install Python and runtime dependencies
+# Based on working Dockerfile approach with retry loop for add-apt-repository
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        software-properties-common \
+        curl \
+    && for i in 1 2 3; do \
+        add-apt-repository -y ppa:deadsnakes/ppa && break || \
+        { echo "Attempt $i failed, retrying in 5s..."; sleep 5; }; \
+    done \
+    && apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        python${PYTHON_VERSION} \
+        python${PYTHON_VERSION}-dev \
+        python${PYTHON_VERSION}-venv \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/* \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 \
+    && update-alternatives --set python3 /usr/bin/python${PYTHON_VERSION} \
+    && ln -sf /usr/bin/python${PYTHON_VERSION}-config /usr/bin/python3-config \
+    && curl -sS ${GET_PIP_URL} | python${PYTHON_VERSION} \
+    && python3 --version && python3 -m pip --version
+
+# Install CUDA development tools for runtime JIT compilation
+RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
+    apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+    cuda-nvcc-${CUDA_VERSION_DASH} \
+    cuda-cudart-${CUDA_VERSION_DASH} \
+    cuda-nvrtc-${CUDA_VERSION_DASH} \
+    cuda-cuobjdump-${CUDA_VERSION_DASH} \
+    libcublas-${CUDA_VERSION_DASH} && \
+    rm -rf /var/lib/apt/lists/*
+
+# Set up CUDA paths
+ENV PATH=/usr/local/cuda-12.2/bin:$PATH
+ENV LD_LIBRARY_PATH=/usr/local/cuda-12.2/lib64:$LD_LIBRARY_PATH
+
+# Create Python virtual environment in runtime stage
+# Use the specific python version to ensure correct venv module
+RUN python${PYTHON_VERSION} -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+ENV VIRTUAL_ENV="/opt/venv"
+
+# Upgrade pip
+RUN pip install --upgrade pip setuptools wheel
+
+# Install PyTorch 2.8.0 (same as build stage)
+RUN pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+    --index-url https://download.pytorch.org/whl/cu128
+
+# Install NumPy compatibility
+RUN pip install "numpy<2" --upgrade
+
+# Install vLLM runtime dependencies
+COPY requirements/common.txt requirements/common.txt
+COPY requirements/cuda.txt requirements/cuda.txt
+RUN pip install -r requirements/cuda.txt
+
+# Install vLLM wheel from build stage
+# Copy the dist directory and install the wheel
+COPY --from=build /workspace/dist /tmp/vllm-dist
+RUN pip install /tmp/vllm-dist/*.whl && rm -rf /tmp/vllm-dist
+
+# Workaround for triton issues
+RUN ldconfig /usr/local/cuda-12.2/compat/
+
+WORKDIR /workspace
+
+# Copy examples and benchmarks
+COPY examples examples
+COPY benchmarks benchmarks
+
+# Verify installation
+RUN python -c "import vllm; print('vLLM version:', vllm.__version__)" && \
+    python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
+
+# Default command
+ENTRYPOINT ["vllm", "serve"]
+
